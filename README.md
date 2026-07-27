@@ -92,6 +92,7 @@ patches/
   enable_gfx90a_asm_paths.py    open AITER's own gfx90a dispatch (~16 sites)
   enable_vllm_aiter_gfx90a.py   let vLLM route ATTENTION to AITER on gfx90a
   enable_fast_fp8_dequant_gfx90a.py   FP8 e4m3 decode fix
+  prefer_aiter_fa_gfx90a.py     make ROCM_AITER_FA selectable, not just admitted
 build/
   build_vllm_aiter_gfx90a.sh    end-to-end patched vLLM image
 tests/         correctness, with --require-asm to fail if ASM never loads
