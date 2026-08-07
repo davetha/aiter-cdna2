@@ -1,4 +1,4 @@
-# W4A8 FlyDSL kernel on gfx90a: compiles and runs, correctness unverified
+# W4A8 FlyDSL kernel on gfx90a: compiles and runs, K=32 correctness fail diagnosed
 
 **Date**: 2026-08-06
 **Hardware**: 2× AMD Instinct MI210 (gfx90a / CDNA2), 64 GB HBM2e each
@@ -17,31 +17,53 @@ After patching, `flydsl_moe_stage1(a_dtype="int8", b_dtype="int4")` **compiled
 and executed** on the MI210, producing correct-shaped output `[M, topk, N]` in
 bf16. See [`tests/test_flydsl_w4a8_gfx90a.py`](../tests/test_flydsl_w4a8_gfx90a.py).
 
-## The K=32 / K=16 problem
+## Correctness: FAILS — K=32 MFMA confirmed (2026-08-07)
 
-The FlyDSL int8 path emits `mfma_i32_16x16x32_i8` (K=32 INT8 MFMA). gfx90a only
-has `mfma_i32_16x16x16_i8` (K=16). This is documented in
-[`int8-gemm.md`](int8-gemm.md) and the [port matrix](port-matrix.md):
+A dequantized fp32 reference comparison definitively confirmed the K=32 issue:
 
-| Instruction | gfx90a | gfx942 |
-|---|---|---|
-| `v_mfma_i32_16x16x16_i8` | assembles | — |
-| `v_mfma_i32_16x16x32_i8` (K=32) | **rejected** | assembles |
+- **Even-indexed output elements: exactly 0.0000** (all zero).
+- **Odd-indexed output elements: non-zero** (0.01–0.08 range).
+- **even/odd ratio: 0.000** — perfect alternating zeros.
+- **max_abs_diff: 0.414**, **mean_rel_err: 15307%** — garbage, not quantization noise.
 
-The test output showed alternating zeros (`[0.0000, 0.0139, 0.0000, ...]`),
-which is consistent with the K=32 instruction silently failing on gfx90a and
-zeroing half the lanes. **Correctness is unverified.**
+The K=32 instruction (`v_mfma_i32_16x16x32_i8`) silently executes on gfx90a as
+a K=16 operation, zeroing half the output lanes. This matches the
+[`int8-gemm.md`](int8-gemm.md) finding that gfx90a rejects the K=32 assembler
+spelling but the FlyDSL-generated code object bypasses the assembler check.
 
-## What is needed before trusting this
+## K=16 adaptation attempted: instruction swap insufficient (2026-08-07)
 
-1. **Correctness comparison**: run identical data through a bf16 reference MoE
-   and the W4A8 kernel; compare outputs. If the K=32 instruction is the
-   problem, the error will be large (not just quantization noise).
-2. **K=16 adaptation**: if K=32 is confirmed as the blocker, the FlyDSL kernel
-   needs to be adapted to use `16x16x16_i8` (K=16) instead of `16x16x32_i8`
-   (K=32). This is a FlyDSL kernel-template change, not a source patch.
-3. **Performance measurement**: once correct, benchmark W4A8 prefill vs W4A16
-   to measure the actual INT8 MFMA speedup on gfx90a.
+Swapped all `mfma_i32_16x16x32i8` → `mfma_i32_16x16x16i8` (the K=16 variant
+that EXISTS in rocdl and assembles on gfx90a). 22 string references replaced.
+**Result: output unchanged** — same alternating zeros, identical values.
+
+Root cause: the K=32 tiling is embedded in **three coordinated sites** in the
+FlyDSL kernel template (`moe_gemm_2stage.py`), not just the MFMA instruction:
+
+1. **MFMA instruction** (line ~211): `mfma_i32_16x16x32i8` — the math op.
+   Swappable to K=16, but insufficient alone.
+2. **Data loading** (line ~744): `load_b_pack_k32(...)` — loads K=32 weight
+   elements per pack from the preshuffled layout. The K=16 MFMA only consumes
+   the first 16; the rest are silently dropped → alternating zeros.
+3. **Data layout** (line ~420): `kpack_bytes = 8` for int4 — tied to the K=32
+   packing density.
+
+A proper K=16 adaptation requires **coordinated changes to all three**: a
+`load_b_pack_k16` variant (or modified `load_b_pack_k32` that loads K=16), the
+K-tiling loop step (32 → 16), and the packing layout. This is FlyDSL kernel
+template engineering, not a string replacement.
+
+## What is needed
+
+1. **K=16 data path**: create a `load_b_pack_k16` (or parameterize
+   `load_b_pack_k32` with a K-dimension argument). Adjust the K-tiling loop to
+   iterate in steps of 16. Adjust `kpack_bytes` for K=16 consumption.
+2. **Correctness re-test**: once the data path feeds K=16, re-run the
+   dequantized-reference comparison. The alternating zeros should disappear.
+3. **Performance**: once correct, benchmark W4A8 prefill vs W4A16.
+4. **Reference**: llama.cpp's `MMQ_MFMA` already does K=16 int8 MFMA with int4
+   weights on gfx90a (verified from source) — a working reference for the
+   K=16 data path pattern.
 
 ## Relationship to other work
 
