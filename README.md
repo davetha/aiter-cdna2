@@ -146,6 +146,17 @@ earlier attempt patched `v_mfma_f32_16x16x16_bf16` to the `f16` opcode (`D3CD`)
 instead of `bf16_1k` (`D3E7`), which is a perfectly valid instruction that
 computes the wrong thing.
 
+**AITER FA silently corrupts sliding-window attention.** On gfx90a,
+`ROCM_AITER_FA` returns grammatical-looking garbage — misspelled tokens, broken
+indentation, self-referential code, infinite repetition — for any model with
+`sliding_attention` layers. No crash, no assert, no log line; the server is
+healthy and the throughput is excellent. Switching only `--attention-backend` to
+`TRITON_ATTN` fixes it. Verified on `poolside/Laguna-S-2.1-INT4` (36 sliding /
+12 full, window 512); linear-attention and Mamba hybrids on the same image are
+unaffected. A Laguna benchmark of 3,820 t/s prefill was published-worthy and
+completely meaningless — it timed a kernel emitting nonsense. See
+[`docs/aiter-fa-sliding-window-corruption.md`](docs/aiter-fa-sliding-window-corruption.md).
+
 **Manifests must be pruned with the kernels.** The loader hard-fails on a
 missing code object, and kernel selection picks by *shape* from the CSV without
 checking the file exists. A manifest that outlives its kernels turns an
