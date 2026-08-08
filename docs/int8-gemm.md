@@ -220,3 +220,74 @@ Benchmark and validation harness: [`../benchmarks/bench_int8_gemm_gfx90a.py`](..
 If a build is interrupted, remove **both** `aiter/jit/build/lock_module_gemm_a8w8`
 (otherwise the next run deadlocks waiting for baton release) and
 `aiter/jit/build/module_gemm_a8w8` (otherwise codegen does not re-run).
+
+## 8. Getting vLLM to actually call it
+
+Everything above is the kernel in isolation. vLLM will not select it on gfx90a
+without [`../patches/enable_aiter_ck_gemm_gfx90a.py`](../patches/enable_aiter_ck_gemm_gfx90a.py),
+and the failure is silent — the engine serves correct output from
+`TritonInt8ScaledMMLinearKernel` and nothing in the log says the fast kernel was
+skipped. Two independent blockers:
+
+**1. Codegen.** `GFX_CU_NUM_MAP` in `aiter/jit/utils/build_targets.py` has
+gfx942/gfx950/gfx1250 only. The lookup raises before instance generation runs,
+so the build dies later on a missing `gemm_a8w8_manifest.h`. Note the shape of
+this bug: the table is consulted **even when the tuned CSV has no rows for your
+architecture**, so an arch that would otherwise fall back to default kernels
+gets a hard error instead of the fallback. MI210 reports 104 CUs.
+
+**2. Selection.** `AiterInt8ScaledMMLinearKernel.is_supported()` gates on
+`rocm_aiter_ops.is_linear_enabled()`, which carries `@if_aiter_supported` →
+`is_aiter_found_and_supported()` → `on_mi3xx()` = gfx942|gfx950.
+`enable_vllm_aiter_gfx90a.py` deliberately narrows its carve-out to **attention
+only**, so linear stays blocked by this project's own patch as well as by
+upstream's.
+
+Both are necessary; neither is sufficient. Serving also needs
+`VLLM_ROCM_USE_AITER=1` **and** `VLLM_ROCM_USE_AITER_LINEAR=1` — a run with the
+patches and without the flags is measuring Triton.
+
+The one log line that distinguishes them:
+
+```
+INFO [__init__.py:670] Selected AiterInt8ScaledMMLinearKernel for CompressedTensorsW8A8Int8
+```
+
+Grep for `Selected .*ScaledMMLinearKernel` before trusting any W8A8 number.
+
+### Measured, end to end
+
+Qwen3.6-27B W8A8 (int8 channel weights, int8 per-token activations), 1× MI210,
+bf16, `--attention-backend ROCM_AITER_FA`. Same server and flags, only the
+kernel differs:
+
+| depth | tg256 Triton | tg256 AITER | speedup |
+|---|---:|---:|---:|
+| 0 | 10.12 | 35.62 | 3.5× |
+| 8192 | 10.04 | 33.42 | 3.3× |
+| 16384 | 9.92 | 31.35 | 3.2× |
+| 32768 | 9.59 | 28.34 | 3.0× |
+
+Prefill gains too: 907.7 → 1,055.5 t/s at d32768 (+17%), since the same linear
+layers carry prefill. This is larger than §4's isolated kernel ratio because the
+Triton fallback also costs scheduler overhead the microbenchmark never sees.
+
+### Tuning it is a null result
+
+§6 notes there are no gfx90a rows in any AITER tuned CSV. Tuning them does not
+help at decode shapes. `gemm_a8w8_tune.py --compare --update_improved` over the
+27B's four linear shapes at M ∈ {1, 2, 8} — 12 shapes, 1,032 candidates:
+
+```
+Total shapes: 12 | Updated: 0 (improved: 0, new: 0) | Skipped: 12
+```
+
+Every shape between **−1.57% and +0.07%**. The reason is visible in the timings:
+M=1 and M=8 on the same shape take 30.60 vs 33.64 µs — 8× the arithmetic for 10%
+more time. These GEMMs sit at the bandwidth roofline, and tile-config tuning
+schedules *compute*. Consistent with §6's conclusion that CDNA2 INT8 wins on
+memory traffic, not arithmetic.
+
+Cheap pre-check before committing a tuning round: time the kernel at M=1 and
+M=16. If they are within ~10%, the shape is latency-bound and tuning will not
+move it.

@@ -91,8 +91,10 @@ tools/
 patches/
   enable_gfx90a_asm_paths.py    open AITER's own gfx90a dispatch (~16 sites)
   enable_vllm_aiter_gfx90a.py   let vLLM route ATTENTION to AITER on gfx90a
+  enable_aiter_ck_gemm_gfx90a.py  let vLLM route LINEAR to the CK int8 GEMM
   enable_fast_fp8_dequant_gfx90a.py   FP8 e4m3 decode fix
   prefer_aiter_fa_gfx90a.py     make ROCM_AITER_FA selectable, not just admitted
+  skip_fp8_tune_instances_gfx90a.py   drop FP8 instances before a tuning run
 build/
   build_vllm_aiter_gfx90a.sh    end-to-end patched vLLM image
 tests/         correctness, with --require-asm to fail if ASM never loads
@@ -113,6 +115,12 @@ python3 patches/enable_gfx90a_asm_paths.py
 
 # 3. if you are serving with vLLM, open its gate too
 python3 patches/enable_vllm_aiter_gfx90a.py
+
+# 3b. ATTENTION ONLY is what step 3 opens. For an int8 (W8A8) checkpoint the
+#     linear layers stay on vLLM's generic Triton kernel until this runs too --
+#     silently, with no log line to distinguish the two. Worth 2.9-3.5x decode.
+python3 patches/enable_aiter_ck_gemm_gfx90a.py
+python3 patches/enable_aiter_ck_gemm_gfx90a.py --check
 
 # 4. prove it
 python3 tests/test_fmha_v3_fwd_asm_gfx90a.py --require-asm
