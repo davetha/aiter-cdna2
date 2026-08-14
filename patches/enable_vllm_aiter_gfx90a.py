@@ -50,8 +50,10 @@ Sites patched
    `rocm_aiter_fa.py`, so widening it cannot affect a non-attention path.
 
 4. `rocm_aiter_fa.py:AiterFlashAttentionBackend.supports_compute_capability`
-   -- a second, independent `on_mi3xx()` that rejects the backend during
-   validation even once the gates above admit it.
+   -- a second, independent check that rejects the backend during validation
+   even once the gates above admit it. vLLM <= 0.26 spelled this `on_mi3xx()`;
+   0.27 rewrote it as `get_cdna_version() > 2`. Both edits are carried and the
+   applicable one is detected at apply time.
 
 5. `scaled_mm/pytorch.py:TorchFP8ScaledMMLinearKernel.is_supported` --
    *narrowed*, not widened. See below.
@@ -180,6 +182,46 @@ _FA_IMPORT_PATCHED = "        from vllm.platforms.rocm import on_gfx9\n"
 _FA_RETURN_ANCHOR = "        return on_mi3xx()\n"
 _FA_RETURN_PATCHED = "        return on_gfx9()\n"
 
+# vLLM 0.27 rewrote this gate. It no longer imports on_mi3xx at all:
+#
+#     from vllm.platforms.rocm import get_cdna_version
+#     return get_cdna_version() > 2
+#
+# Same meaning -- CDNA3 or newer, so not gfx90a -- but a different spelling and
+# a different import, so the 0.26 edits above match nothing and the patch aborts.
+#
+# Bound the range rather than widening the comparison. get_cdna_version() is
+# gfx90a=2, gfx942=3, gfx950=4, gfx1250=5; `>= 2` would also admit gfx1250,
+# which vLLM classifies as CDNA but which these repatched gfx90a code objects
+# must never be dispatched to. `2 <= v <= 4` reproduces exactly the set the
+# 0.26 patch selected with on_gfx9(), and keeps upstream's own helper so their
+# note about DeviceCapability being unreliable on ROCm still holds.
+_FA_CDNA_ANCHOR = "        return get_cdna_version() > 2\n"
+_FA_CDNA_PATCHED = "        return 2 <= get_cdna_version() <= 4\n"
+
+
+def _fa_patches():
+    """Pick the FA edits matching the installed vLLM.
+
+    Detected, not guessed: 0.27 needs one edit (the return, import unchanged),
+    0.26 needs two (import and return). If the file matches neither form we
+    return the 0.26 edits so apply() reports a loud mismatch rather than
+    silently skipping the gate -- an unpatched gate is an image that is merely
+    slow, which is the failure this whole repo exists to prevent.
+    """
+    try:
+        text = open(AITER_FA).read()
+    except OSError:
+        text = ""
+
+    if _FA_CDNA_ANCHOR in text or _FA_CDNA_PATCHED in text:
+        return [(AITER_FA, _FA_CDNA_ANCHOR, _FA_CDNA_PATCHED, 1)]
+
+    return [
+        (AITER_FA, _FA_IMPORT_ANCHOR, _FA_IMPORT_PATCHED, 1),
+        (AITER_FA, _FA_RETURN_ANCHOR, _FA_RETURN_PATCHED, 1),
+    ]
+
 # 5. Narrow the torch scaled_mm gate so CDNA2 is refused with a real reason.
 _CC_ANCHOR = '''        if compute_capability is not None and compute_capability < 89:
             return False, "requires compute capability 89 and above."
@@ -212,8 +254,7 @@ PATCHES = [
     (AITER_OPS, _DECORATOR_ANCHOR, _DECORATOR_PATCHED, 1),
     (AITER_OPS, _MHA_ANCHOR, _MHA_PATCHED, 1),
     (AITER_OPS, _SHUFFLE_ANCHOR, _SHUFFLE_PATCHED, 1),
-    (AITER_FA, _FA_IMPORT_ANCHOR, _FA_IMPORT_PATCHED, 1),
-    (AITER_FA, _FA_RETURN_ANCHOR, _FA_RETURN_PATCHED, 1),
+    *_fa_patches(),
     (SCALED_MM, _CC_ANCHOR, _CC_PATCHED, 1),
 ]
 
