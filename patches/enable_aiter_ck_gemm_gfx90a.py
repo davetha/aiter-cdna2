@@ -133,6 +133,42 @@ _REGISTER_EQUIV = '''    @if_aiter_attention_supported
     def register_ops_once() -> None:
 '''
 
+# vLLM 0.27 dropped the decorator entirely and inlined the guard:
+#
+#     @staticmethod
+#     def register_ops_once() -> None:
+#         global _OPS_REGISTERED
+#
+#         if not (
+#             is_aiter_found_and_supported() or is_aiter_found_and_supported_on_rdna4()
+#         ):
+#
+# Structurally that is what this patch always wanted -- a body guard rather than
+# a decorator -- but the condition still excludes CDNA2, because
+# is_aiter_found_and_supported() keeps on_mi3xx(). So the edit is now additive:
+# extend the disjunction instead of rewriting the signature.
+#
+# is_aiter_attention_supported() is introduced by enable_vllm_aiter_gfx90a.py,
+# which add-aiter.sh runs FIRST. Applying this patch on its own to a stock tree
+# would therefore produce a NameError at import; the ordering is a requirement,
+# not a convenience.
+_REGISTER_027_ANCHOR = '''        if not (
+            is_aiter_found_and_supported() or is_aiter_found_and_supported_on_rdna4()
+        ):
+'''
+
+_REGISTER_027_PATCHED = '''        if not (
+            is_aiter_found_and_supported() or is_aiter_found_and_supported_on_rdna4()
+            # gfx90a carve-out -- see patches/enable_aiter_ck_gemm_gfx90a.py.
+            # Registration only DECLARES ops; every impl imports its aiter
+            # symbol lazily inside the call body, so declaring MI300-only ops
+            # here costs nothing and cannot execute them. Without this,
+            # torch.ops.vllm.rocm_aiter_w8a8_gemm does not exist on CDNA2 and
+            # the CK GEMM cannot be called whatever the selection gate says.
+            or is_aiter_attention_supported()
+        ):
+'''
+
 _REGISTER_PATCHED = '''    @staticmethod
     def register_ops_once() -> None:
         # gfx90a carve-out -- see configs/enable_aiter_ck_gemm_gfx90a.py.
@@ -169,7 +205,13 @@ def check(site: pathlib.Path) -> int:
     # Satisfied either by our carve-out or by upstream's own
     # @if_aiter_attention_supported decorator (vLLM >= 0.26.1). Both mean the
     # ops get registered on gfx90a, which is all this site exists to ensure.
-    reg_ours = _REGISTER_PATCHED in ops_s and _REGISTER_ANCHOR not in ops_s
+    # Either spelling of our carve-out counts: 0.27 extends the inlined
+    # disjunction, <=0.26 rewrites the decorated signature. check() must accept
+    # both or it contradicts apply(), which is worse than either being wrong.
+    reg_ours = (
+        (_REGISTER_027_PATCHED in ops_s and _REGISTER_027_ANCHOR not in ops_s)
+        or (_REGISTER_PATCHED in ops_s and _REGISTER_ANCHOR not in ops_s)
+    )
     reg_upstream = _REGISTER_EQUIV in ops_s
     reg_done = reg_ours or reg_upstream
     reg_how = (
@@ -214,11 +256,17 @@ def apply(site: pathlib.Path) -> int:
             "configs/enable_vllm_aiter_gfx90a.py FIRST -- this patch reuses "
             "the predicate that script inserts."
         )
-    for name, anchor, patched, equivalent in (
-        ("is_linear_enabled", _LINEAR_ANCHOR, _LINEAR_PATCHED, None),
-        ("register_ops_once", _REGISTER_ANCHOR, _REGISTER_PATCHED, _REGISTER_EQUIV),
+    # Each site carries one or more (anchor, patched) spellings, newest first,
+    # because upstream rewrote register_ops_once between 0.26 and 0.27. Exactly
+    # one must match: zero means upstream moved again and we abort rather than
+    # ship a half-patched image; more than one would mean the anchors are
+    # ambiguous and the choice is not ours to guess.
+    for name, variants, equivalent in (
+        ("is_linear_enabled", ((_LINEAR_ANCHOR, _LINEAR_PATCHED),), None),
+        ("register_ops_once", ((_REGISTER_027_ANCHOR, _REGISTER_027_PATCHED),
+                               (_REGISTER_ANCHOR, _REGISTER_PATCHED)), _REGISTER_EQUIV),
     ):
-        if patched in ops_s:
+        if any(p in ops_s for _, p in variants):
             print(f"  {name} already carved out; leaving it alone")
             continue
         if equivalent is not None and equivalent in ops_s:
@@ -228,13 +276,15 @@ def apply(site: pathlib.Path) -> int:
             # patch and leave is_linear_enabled unwritten.
             print(f"  {name} already gated by if_aiter_attention_supported upstream")
             continue
-        n = ops_s.count(anchor)
-        if n != 1:
+        hits = [(a, p) for a, p in variants if ops_s.count(a) == 1]
+        if len(hits) != 1:
+            counts = ", ".join(str(ops_s.count(a)) for a, _ in variants)
             sys.exit(
-                f"FATAL: {name} anchor matched {n} times in {ops}, expected "
-                "exactly 1. Upstream changed the method; re-derive this patch "
-                "rather than forcing it."
+                f"FATAL: {name} matched {len(hits)} known spelling(s) in {ops} "
+                f"(per-variant counts: {counts}), expected exactly 1. Upstream "
+                "changed the method; re-derive this patch rather than forcing it."
             )
+        anchor, patched = hits[0]
         ops_s = ops_s.replace(anchor, patched)
         print(f"  patched {ops}: {name} carve-out")
     ops.write_text(ops_s)
@@ -271,14 +321,17 @@ def revert(site: pathlib.Path) -> int:
 
     ops_s = _read(ops)
     touched = False
-    for name, anchor, patched in (
-        ("is_linear_enabled", _LINEAR_ANCHOR, _LINEAR_PATCHED),
-        ("register_ops_once", _REGISTER_ANCHOR, _REGISTER_PATCHED),
+    for name, variants in (
+        ("is_linear_enabled", ((_LINEAR_ANCHOR, _LINEAR_PATCHED),)),
+        ("register_ops_once", ((_REGISTER_027_ANCHOR, _REGISTER_027_PATCHED),
+                               (_REGISTER_ANCHOR, _REGISTER_PATCHED))),
     ):
-        if patched not in ops_s:
+        present = [(a, p) for a, p in variants if p in ops_s]
+        if not present:
             print(f"  {name} carve-out not present; nothing to revert")
             continue
-        ops_s = ops_s.replace(patched, anchor)
+        for anchor, patched in present:
+            ops_s = ops_s.replace(patched, anchor)
         touched = True
         print(f"  reverted {name}")
     if touched:
