@@ -249,19 +249,43 @@ _CC_PATCHED = '''        if compute_capability is not None and compute_capabilit
         return True, None
 '''
 
-# (path, unpatched, patched, expected occurrences)
+# Site 5 is SUPERSEDED when the vLLM fork carries its own narrowing.
+#
+# davetha/vllm's w8a16-fp8-gfx90a branch fixes the same latent bug directly in
+# the fork, and does it better: it gates on `get_cdna_version() <= 2 and not
+# on_rdna4()`, which also admits RDNA4, where this shim used `not on_mi3xx()`.
+# When that patch is present neither the anchor nor this shim's patched form is
+# in the file, so a plain occurrence count reports "found 0" and fails the whole
+# run -- which is what it did against v0.28.0rc2+mi210.6.
+#
+# Detect the fork's fix and skip, rather than loosening the anchor. Loosening it
+# would let a genuinely moved upstream site pass silently, and the point of the
+# exact-count check is that it cannot.
+_CC_SUPERSEDED = 'return False, "requires CDNA3+ or RDNA4 on ROCm"'
+
+# (path, unpatched, patched, expected occurrences[, superseded-marker])
 PATCHES = [
     (AITER_OPS, _DECORATOR_ANCHOR, _DECORATOR_PATCHED, 1),
     (AITER_OPS, _MHA_ANCHOR, _MHA_PATCHED, 1),
     (AITER_OPS, _SHUFFLE_ANCHOR, _SHUFFLE_PATCHED, 1),
     *_fa_patches(),
-    (SCALED_MM, _CC_ANCHOR, _CC_PATCHED, 1),
+    (SCALED_MM, _CC_ANCHOR, _CC_PATCHED, 1, _CC_SUPERSEDED),
 ]
 
 
 def apply(revert: bool = False, check: bool = False) -> int:
     failures = 0
-    for path, old, new, want in PATCHES:
+    for entry in PATCHES:
+        path, old, new, want = entry[:4]
+        superseded = entry[4] if len(entry) > 4 else None
+        if superseded:
+            try:
+                if superseded in open(path).read():
+                    print(f" superseded {path.rsplit('/', 1)[-1]:<16} "
+                          "(the vLLM fork already carries this fix)")
+                    continue
+            except OSError:
+                pass
         if revert:
             old, new = new, old
         try:
