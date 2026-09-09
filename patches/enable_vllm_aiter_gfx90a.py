@@ -261,7 +261,14 @@ _CC_PATCHED = '''        if compute_capability is not None and compute_capabilit
 # Detect the fork's fix and skip, rather than loosening the anchor. Loosening it
 # would let a genuinely moved upstream site pass silently, and the point of the
 # exact-count check is that it cannot.
-_CC_SUPERSEDED = 'return False, "requires CDNA3+ or RDNA4 on ROCm"'
+_CC_SUPERSEDED = (
+    # the vLLM fork's spelling
+    'return False, "requires CDNA3+ or RDNA4 on ROCm"',
+    # upstream's own fix: an explicit ROCm allow-list that omits gfx90a, so the
+    # exclusion this patch adds is already in force. Verified on gfx90a:
+    #   is_supported() -> (False, 'requires a platform with torch FP8 ...')
+    "def _rocm_torch_fp8_scaled_mm_supported",
+)
 
 # (path, unpatched, patched, expected occurrences[, superseded-marker])
 PATCHES = [
@@ -279,10 +286,13 @@ def apply(revert: bool = False, check: bool = False) -> int:
         path, old, new, want = entry[:4]
         superseded = entry[4] if len(entry) > 4 else None
         if superseded:
+            markers = superseded if isinstance(superseded, tuple) else (superseded,)
             try:
-                if superseded in open(path).read():
+                body = open(path).read()
+                hit = next((m for m in markers if m in body), None)
+                if hit is not None:
                     print(f" superseded {path.rsplit('/', 1)[-1]:<16} "
-                          "(the vLLM fork already carries this fix)")
+                          "(this fix is already present upstream or in the fork)")
                     continue
             except OSError:
                 pass
