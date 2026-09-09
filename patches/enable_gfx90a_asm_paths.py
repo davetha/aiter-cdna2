@@ -227,17 +227,18 @@ PATCHES = [
     # and already-applied and insert the block again on every run.
     (
         GEMM_GEN_PY,
-        'from gemm_a8w8_common import (  # noqa: E402\n'
-        '    default_kernels_dict,\n'
-        '    kernelInstance,\n'
+        # Anchored from `kernels_list,` rather than from the `from
+        # gemm_a8w8_common import (` line, because that line carried a trailing
+        # `  # noqa: E402` up to AITER v0.1.20 and does not in v0.1.21. Excluding
+        # the volatile part gives ONE anchor that matches both releases, which is
+        # better than carrying two spellings. Still unique (one occurrence) and
+        # still not a prefix of the patched text, since the insert lands between
+        # `)` and `class`.
         '    kernels_list,\n'
         ')\n'
         '\n'
         '\n'
         'class gemm_a8w8_fwd_codegen:\n',
-        'from gemm_a8w8_common import (  # noqa: E402\n'
-        '    default_kernels_dict,\n'
-        '    kernelInstance,\n'
         '    kernels_list,\n'
         ')\n'
         '\n'
